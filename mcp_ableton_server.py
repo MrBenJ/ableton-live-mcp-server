@@ -63,7 +63,33 @@ class AbletonClient:
 
 
 # Initialize the MCP server
-mcp = FastMCP("Ableton Live Controller", dependencies=["python-osc"])
+mcp = FastMCP(
+    "Ableton Live Controller",
+    dependencies=["python-osc"],
+    instructions="""
+You are controlling Ableton Live via OSC through the MCP tools provided by this server.
+
+CRITICAL — Track and scene indices are NOT stable:
+Ableton track indices and scene indices shift whenever tracks or scenes are added, deleted,
+or reordered. An index that was correct at the start of a conversation may point to a
+completely different track by the time you use it.
+
+RULES:
+1. Never assume, cache, or reuse a track index across steps. Always resolve it fresh.
+2. Before any operation that takes a track_index, call find_track_by_name() first to get
+   the current live index. Use that returned index immediately — do not store it for later.
+3. Before any operation that takes a scene_index, call find_scene_by_name() first to get
+   the current live index.
+4. If a user refers to a track by name (e.g. "the Bass track"), always look it up with
+   find_track_by_name() — never guess the index.
+5. If find_track_by_name() returns multiple matches, clarify with the user before proceeding.
+
+Example workflow for "add a note to the Bass track":
+  1. find_track_by_name("Bass")  → returns "index 2: Bass"
+  2. get_clip_info(track_index=2, scene_index=0)  → verify clip exists
+  3. add_notes_to_clip(track_index=2, ...)
+""",
+)
 
 # Create Ableton client
 ableton_client = AbletonClient()
@@ -184,6 +210,8 @@ async def get_clip_info(track_index: int, scene_index: int) -> str:
     """
     Get the name and length of a clip at a given track/scene slot.
     Use this to check whether a clip exists before writing to it.
+    IMPORTANT: Track and scene indices shift often. Call find_track_by_name() and
+    find_scene_by_name() first to get current indices — never assume or reuse old ones.
 
     Args:
         track_index: Zero-based index of the track
@@ -215,6 +243,7 @@ async def get_clip_info(track_index: int, scene_index: int) -> str:
 async def set_clip_name(track_index: int, clip_index: int, name: str) -> str:
     """
     Set the name of a clip.
+    IMPORTANT: Track indices shift often. Call find_track_by_name() first to get the current index.
 
     Args:
         track_index: Zero-based index of the track
@@ -237,6 +266,8 @@ async def set_clip_name(track_index: int, clip_index: int, name: str) -> str:
 async def delete_clip(track_index: int, scene_index: int) -> str:
     """
     Delete a clip from a clip slot. Use this to undo accidental writes.
+    IMPORTANT: Track and scene indices shift often. Call find_track_by_name() and
+    find_scene_by_name() first to get current indices — never assume or reuse old ones.
 
     Args:
         track_index: Zero-based index of the track
@@ -258,6 +289,8 @@ async def delete_clip(track_index: int, scene_index: int) -> str:
 async def create_clip(track_index: int, scene_index: int, length_beats: float) -> str:
     """
     Create an empty MIDI clip in a clip slot in Ableton's session view.
+    IMPORTANT: Track and scene indices shift often. Call find_track_by_name() and
+    find_scene_by_name() first to get current indices — never assume or reuse old ones.
 
     Args:
         track_index: Zero-based index of the track
@@ -282,6 +315,7 @@ async def add_notes_to_clip(track_index: int, clip_index: int, notes: List[dict]
     """
     Add MIDI notes to an existing clip in Ableton Live.
     IMPORTANT: The clip must already exist — call create_clip first if needed.
+    IMPORTANT: Track indices shift often. Call find_track_by_name() first to get the current index.
 
     Args:
         track_index: Zero-based index of the track
@@ -331,6 +365,7 @@ async def add_notes_to_clip(track_index: int, clip_index: int, notes: List[dict]
 async def get_notes_from_clip(track_index: int, clip_index: int) -> str:
     """
     Get all MIDI notes from an existing clip in Ableton Live.
+    IMPORTANT: Track indices shift often. Call find_track_by_name() first to get the current index.
 
     Args:
         track_index: Zero-based index of the track
@@ -371,6 +406,7 @@ async def get_notes_from_clip(track_index: int, clip_index: int) -> str:
 async def get_track_devices(track_index: int) -> str:
     """
     Get the list of devices on a track.
+    IMPORTANT: Track indices shift often. Call find_track_by_name() first to get the current index.
 
     Args:
         track_index: Zero-based index of the track
@@ -393,6 +429,7 @@ async def get_track_devices(track_index: int) -> str:
 async def get_device_parameters(track_index: int, device_index: int) -> str:
     """
     Get all parameter names and values for a device on a track.
+    IMPORTANT: Track indices shift often. Call find_track_by_name() first to get the current index.
 
     Args:
         track_index: Zero-based index of the track
@@ -421,6 +458,7 @@ async def get_device_parameters(track_index: int, device_index: int) -> str:
 async def set_device_parameter(track_index: int, device_index: int, parameter_index: int, value: float) -> str:
     """
     Set the value of a device parameter.
+    IMPORTANT: Track indices shift often. Call find_track_by_name() first to get the current index.
 
     Args:
         track_index: Zero-based index of the track
@@ -482,6 +520,7 @@ async def set_song_tempo(bpm: float) -> str:
 async def play_scene(scene_index: int) -> str:
     """
     Trigger (play) a scene in Ableton Live's session view.
+    IMPORTANT: Scene indices shift often. Call find_scene_by_name() first to get the current index.
 
     Args:
         scene_index: Zero-based index of the scene to trigger
