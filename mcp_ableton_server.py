@@ -157,6 +157,80 @@ async def add_notes_to_clip(track_index: int, clip_index: int, notes: List[dict]
         return f"Error adding notes: {response.get('message', 'Unknown error')}"
 
 
+@mcp.tool()
+async def get_track_devices(track_index: int) -> str:
+    """
+    Get the list of devices on a track.
+
+    Args:
+        track_index: Zero-based index of the track
+
+    Returns:
+        A formatted string listing device names and their indices
+    """
+    response = await ableton_client.send_command('/live/track/get/devices', [track_index])
+    if response.get('status') == 'success':
+        data = response.get('data', ())
+        if not data:
+            return "No devices found on track"
+        devices = list(data)
+        return "\n".join(f"[{i}] {name}" for i, name in enumerate(devices))
+    else:
+        return f"Error getting devices: {response.get('message', 'Unknown error')}"
+
+
+@mcp.tool()
+async def get_device_parameters(track_index: int, device_index: int) -> str:
+    """
+    Get all parameter names and values for a device on a track.
+
+    Args:
+        track_index: Zero-based index of the track
+        device_index: Zero-based index of the device on the track
+
+    Returns:
+        A formatted string listing parameter indices, names, and current values
+    """
+    names_response = await ableton_client.send_command(
+        '/live/device/get/parameters/name', [track_index, device_index]
+    )
+    values_response = await ableton_client.send_command(
+        '/live/device/get/parameters/value', [track_index, device_index]
+    )
+
+    if names_response.get('status') == 'success' and values_response.get('status') == 'success':
+        names = list(names_response.get('data', ()))
+        values = list(values_response.get('data', ()))
+        lines = [f"[{i}] {name} = {value}" for i, (name, value) in enumerate(zip(names, values))]
+        return "\n".join(lines)
+    else:
+        return f"Error getting parameters: {names_response.get('message', values_response.get('message', 'Unknown error'))}"
+
+
+@mcp.tool()
+async def set_device_parameter(track_index: int, device_index: int, parameter_index: int, value: float) -> str:
+    """
+    Set the value of a device parameter.
+
+    Args:
+        track_index: Zero-based index of the track
+        device_index: Zero-based index of the device on the track
+        parameter_index: Zero-based index of the parameter
+        value: The value to set
+
+    Returns:
+        Status message
+    """
+    response = await ableton_client.send_command(
+        '/live/device/set/parameter/value',
+        [track_index, device_index, parameter_index, value]
+    )
+    if response.get('status') in ('success', 'sent'):
+        return f"Set parameter {parameter_index} to {value} on device {device_index}, track {track_index}"
+    else:
+        return f"Error setting parameter: {response.get('message', 'Unknown error')}"
+
+
 if __name__ == "__main__":
     try:
         mcp.run()
