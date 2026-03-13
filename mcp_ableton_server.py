@@ -512,7 +512,20 @@ async def stop_all_clips() -> str:
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Ableton Live MCP Server")
+    parser.add_argument("--sse", action="store_true", help="Run in SSE mode (HTTP server) instead of stdio")
+    parser.add_argument("--port", type=int, default=8765, help="Port for SSE mode (default: 8765)")
+    parser.add_argument("--host", type=str, default="127.0.0.1", help="Host for SSE mode (default: 127.0.0.1)")
+    args = parser.parse_args()
+
     try:
-        mcp.run()
+        if args.sse:
+            mcp.settings.host = args.host
+            mcp.settings.port = args.port
+            print(f"Starting MCP server in SSE mode on {args.host}:{args.port}", flush=True)
+            mcp.run(transport="sse")
+        else:
+            mcp.run()
     finally:
         ableton_client.close()
