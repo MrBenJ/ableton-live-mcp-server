@@ -2,8 +2,6 @@
 
 Control Ableton Live with AI agents using natural language. This server connects AI tools like Claude to your Ableton Live session, letting you say things like *"prepare a set for recording a rock band"* and have it actually happen.
 
-[![Control Ableton Live with LLMs](https://img.youtube.com/vi/12MzsQ3V7cs/hqdefault.jpg)](https://www.youtube.com/watch?v=12MzsQ3V7cs)
-
 ---
 
 ## How It Works
