@@ -68,6 +68,23 @@ mcp = FastMCP("Ableton Live Controller", dependencies=["python-osc"])
 # Create Ableton client
 ableton_client = AbletonClient()
 
+# Note name lookup (prefers flats)
+NOTE_NAMES = ['C', 'Db', 'D', 'Eb', 'E', 'F', 'Gb', 'G', 'Ab', 'A', 'Bb', 'B']
+
+def midi_to_note_name(pitch: int) -> str:
+    return NOTE_NAMES[int(pitch) % 12] + str(int(pitch) // 12 - 1)
+
+def strip_osc_prefix(data: list, *expected_prefix_ints) -> list:
+    """
+    AbletonOSC often prepends track_index and/or clip_index to response data.
+    Strip them if present, using int comparison to handle float/int mismatches.
+    """
+    prefix = list(expected_prefix_ints)
+    if len(data) >= len(prefix):
+        if all(int(data[i]) == prefix[i] for i in range(len(prefix))):
+            return data[len(prefix):]
+    return data
+
 
 # ----- TOOLS -----
 
@@ -93,6 +110,148 @@ async def get_track_names(index_min: Optional[int] = None, index_max: Optional[i
         return "Track Names: " + ", ".join(str(n) for n in data)
     else:
         return f"Error getting track names: {response.get('message', 'Unknown error')}"
+
+
+@mcp.tool()
+async def find_track_by_name(name: str) -> str:
+    """
+    Find a track's index by searching for its name (case-insensitive, partial match).
+
+    Args:
+        name: The track name or partial name to search for
+
+    Returns:
+        Matching track indices and names
+    """
+    response = await ableton_client.send_command('/live/song/get/track_names', [])
+    if response.get('status') == 'success':
+        tracks = list(response.get('data', ()))
+        matches = [
+            f"index {i}: {t}" for i, t in enumerate(tracks)
+            if name.lower() in str(t).lower()
+        ]
+        if not matches:
+            return f"No tracks found matching '{name}'"
+        return "\n".join(matches)
+    else:
+        return f"Error getting tracks: {response.get('message', 'Unknown error')}"
+
+
+@mcp.tool()
+async def find_scene_by_name(name: str) -> str:
+    """
+    Find a scene's index by searching for its name (case-insensitive, partial match).
+    Use this instead of guessing scene indices.
+
+    Args:
+        name: The scene name or partial name to search for (e.g. "BREAK", "DROP")
+
+    Returns:
+        Matching scene indices and names
+    """
+    # Get scene count first to know how many to iterate
+    count_response = await ableton_client.send_command('/live/song/get/num_scenes', [])
+    if count_response.get('status') == 'success':
+        count_data = count_response.get('data', ())
+        num_scenes = int(count_data[0]) if count_data else 16
+    else:
+        num_scenes = 16  # fallback if endpoint not supported
+
+    # Fetch each scene name individually via /live/scene/get/name
+    scenes = []
+    for i in range(num_scenes):
+        r = await ableton_client.send_command('/live/scene/get/name', [i])
+        if r.get('status') == 'success':
+            data = strip_osc_prefix(list(r.get('data', ())), i)
+            scene_name = str(data[0]) if data else ''
+            scenes.append((i, scene_name))
+        else:
+            # Stop on first failure — scenes are contiguous in Ableton
+            break
+
+    if not scenes:
+        return "Could not retrieve scene names"
+
+    matches = [f"index {i}: '{s}'" for i, s in scenes if name.lower() in s.lower()]
+    if not matches:
+        all_scenes = ", ".join(f"{i}:'{s}'" for i, s in scenes)
+        return f"No scenes found matching '{name}'. All scenes: {all_scenes}"
+    return "\n".join(matches)
+
+
+@mcp.tool()
+async def get_clip_info(track_index: int, scene_index: int) -> str:
+    """
+    Get the name and length of a clip at a given track/scene slot.
+    Use this to check whether a clip exists before writing to it.
+
+    Args:
+        track_index: Zero-based index of the track
+        scene_index: Zero-based index of the scene
+
+    Returns:
+        Clip name, length in beats, or a message if no clip exists
+    """
+    name_response = await ableton_client.send_command(
+        '/live/clip/get/name', [track_index, scene_index]
+    )
+    length_response = await ableton_client.send_command(
+        '/live/clip/get/length', [track_index, scene_index]
+    )
+
+    if name_response.get('status') != 'success' and length_response.get('status') != 'success':
+        return f"No clip at track {track_index}, scene {scene_index}"
+
+    name_data = strip_osc_prefix(list(name_response.get('data', ())), track_index, scene_index)
+    length_data = strip_osc_prefix(list(length_response.get('data', ())), track_index, scene_index)
+
+    clip_name = name_data[0] if name_data else "(unnamed)"
+    clip_length = length_data[0] if length_data else "unknown"
+
+    return f"Clip at track {track_index}, scene {scene_index}: name='{clip_name}', length={clip_length} beats"
+
+
+@mcp.tool()
+async def set_clip_name(track_index: int, clip_index: int, name: str) -> str:
+    """
+    Set the name of a clip.
+
+    Args:
+        track_index: Zero-based index of the track
+        clip_index: Zero-based index of the clip slot
+        name: The new name for the clip
+
+    Returns:
+        Status message
+    """
+    response = await ableton_client.send_command(
+        '/live/clip/set/name', [track_index, clip_index, name]
+    )
+    if response.get('status') in ('success', 'sent'):
+        return f"Named clip at track {track_index}, clip {clip_index} -> '{name}'"
+    else:
+        return f"Error setting clip name: {response.get('message', 'Unknown error')}"
+
+
+@mcp.tool()
+async def delete_clip(track_index: int, scene_index: int) -> str:
+    """
+    Delete a clip from a clip slot. Use this to undo accidental writes.
+
+    Args:
+        track_index: Zero-based index of the track
+        scene_index: Zero-based index of the scene
+
+    Returns:
+        Status message
+    """
+    response = await ableton_client.send_command(
+        '/live/clip_slot/delete_clip', [track_index, scene_index]
+    )
+    if response.get('status') in ('success', 'sent'):
+        return f"Deleted clip at track {track_index}, scene {scene_index}"
+    else:
+        return f"Error deleting clip: {response.get('message', 'Unknown error')}"
 
 
 @mcp.tool()
@@ -122,6 +281,7 @@ async def create_clip(track_index: int, scene_index: int, length_beats: float) -
 async def add_notes_to_clip(track_index: int, clip_index: int, notes: List[dict]) -> str:
     """
     Add MIDI notes to an existing clip in Ableton Live.
+    IMPORTANT: The clip must already exist — call create_clip first if needed.
 
     Args:
         track_index: Zero-based index of the track
@@ -136,6 +296,16 @@ async def add_notes_to_clip(track_index: int, clip_index: int, notes: List[dict]
     Returns:
         Status message
     """
+    # Pre-check: verify clip exists before attempting to write
+    check = await ableton_client.send_command(
+        '/live/clip/get/length', [track_index, clip_index]
+    )
+    if check.get('status') != 'success':
+        return (
+            f"No clip found at track {track_index}, clip {clip_index}. "
+            f"Call create_clip first."
+        )
+
     # AbletonOSC expects: track_id, clip_id, then flat list of [pitch, time, duration, velocity, mute, ...]
     flat_notes = []
     for note in notes:
@@ -155,6 +325,46 @@ async def add_notes_to_clip(track_index: int, clip_index: int, notes: List[dict]
         return f"Added {len(notes)} notes to clip at track {track_index}, clip {clip_index}"
     else:
         return f"Error adding notes: {response.get('message', 'Unknown error')}"
+
+
+@mcp.tool()
+async def get_notes_from_clip(track_index: int, clip_index: int) -> str:
+    """
+    Get all MIDI notes from an existing clip in Ableton Live.
+
+    Args:
+        track_index: Zero-based index of the track
+        clip_index: Zero-based index of the clip slot
+
+    Returns:
+        A formatted string listing all notes with pitch, time, duration, velocity
+    """
+    response = await ableton_client.send_command(
+        '/live/clip/get/notes',
+        [track_index, clip_index]
+    )
+    if response.get('status') == 'success':
+        data = list(response.get('data', ()))
+        if not data:
+            return "No notes found in clip"
+        # BUG FIX: use int() comparison to handle float/int mismatch from OSC
+        data = strip_osc_prefix(data, track_index, clip_index)
+        if not data:
+            return "Clip exists but contains no notes"
+        # Remaining data is flat list: pitch, time, duration, velocity, mute, ...
+        notes = []
+        for i in range(0, len(data) - 4, 5):
+            chunk = data[i:i+5]
+            if len(chunk) < 5:
+                break
+            pitch, time, duration, velocity, mute = chunk
+            notes.append(
+                f"  {midi_to_note_name(pitch)} (MIDI {int(pitch)}) "
+                f"| beat {float(time):.2f} | dur {float(duration):.2f} | vel {int(velocity)}"
+            )
+        return f"Notes in clip ({len(notes)} total):\n" + "\n".join(notes)
+    else:
+        return f"Error getting notes: {response.get('message', 'Unknown error')}"
 
 
 @mcp.tool()
@@ -229,6 +439,76 @@ async def set_device_parameter(track_index: int, device_index: int, parameter_in
         return f"Set parameter {parameter_index} to {value} on device {device_index}, track {track_index}"
     else:
         return f"Error setting parameter: {response.get('message', 'Unknown error')}"
+
+
+@mcp.tool()
+async def get_song_tempo() -> str:
+    """
+    Get the current tempo of the Ableton Live session in BPM.
+
+    Returns:
+        Current tempo as a string
+    """
+    response = await ableton_client.send_command('/live/song/get/tempo', [])
+    if response.get('status') == 'success':
+        data = response.get('data', ())
+        tempo = float(data[0]) if data else None
+        if tempo is not None:
+            return f"Current tempo: {tempo:.2f} BPM"
+        return "Tempo data not available"
+    else:
+        return f"Error getting tempo: {response.get('message', 'Unknown error')}"
+
+
+@mcp.tool()
+async def set_song_tempo(bpm: float) -> str:
+    """
+    Set the tempo of the Ableton Live session.
+
+    Args:
+        bpm: Tempo in beats per minute (e.g. 120.0)
+
+    Returns:
+        Status message
+    """
+    response = await ableton_client.send_command('/live/song/set/tempo', [bpm])
+    if response.get('status') in ('success', 'sent'):
+        return f"Tempo set to {bpm:.2f} BPM"
+    else:
+        return f"Error setting tempo: {response.get('message', 'Unknown error')}"
+
+
+@mcp.tool()
+async def play_scene(scene_index: int) -> str:
+    """
+    Trigger (play) a scene in Ableton Live's session view.
+
+    Args:
+        scene_index: Zero-based index of the scene to trigger
+
+    Returns:
+        Status message
+    """
+    response = await ableton_client.send_command('/live/song/trigger_scene', [scene_index])
+    if response.get('status') in ('success', 'sent'):
+        return f"Triggered scene {scene_index}"
+    else:
+        return f"Error triggering scene: {response.get('message', 'Unknown error')}"
+
+
+@mcp.tool()
+async def stop_all_clips() -> str:
+    """
+    Stop all currently playing clips in Ableton Live.
+
+    Returns:
+        Status message
+    """
+    response = await ableton_client.send_command('/live/song/stop_all_clips', [])
+    if response.get('status') in ('success', 'sent'):
+        return "Stopped all clips"
+    else:
+        return f"Error stopping clips: {response.get('message', 'Unknown error')}"
 
 
 if __name__ == "__main__":
