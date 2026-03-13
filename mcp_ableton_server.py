@@ -2,6 +2,7 @@ from mcp.server.fastmcp import FastMCP
 import asyncio
 import json
 import socket
+import struct
 import sys
 from typing import Optional, List
 
@@ -30,16 +31,38 @@ class AbletonClient:
             self.connected = False
             return False
 
+    def _recv_all(self, n: int) -> bytes:
+        """Read exactly n bytes from the socket, handling TCP fragmentation.
+
+        TCP does not guarantee that a single recv() returns all requested bytes —
+        large payloads (e.g. clips with many MIDI notes) can arrive in pieces.
+        This method loops until exactly n bytes have been accumulated.
+        Raises ConnectionError if the connection closes before n bytes are read.
+        """
+        buf = b''
+        while len(buf) < n:
+            chunk = self.sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError('Connection closed by daemon before full message received')
+            buf += chunk
+        return buf
+
     def _send_recv(self, message: dict) -> dict:
-        """Synchronous send + receive — run in executor to avoid blocking the event loop."""
+        """Synchronous send + receive — run in executor to avoid blocking the event loop.
+
+        Uses a 4-byte big-endian length prefix before every JSON payload so that
+        the receiver always knows exactly how many bytes to read. This prevents
+        both silent truncation (old recv(4096) limit) and fragmented-read bugs
+        where TCP delivers a large message across multiple recv() calls.
+        """
         if not self._ensure_connected():
             return {'status': 'error', 'message': 'Not connected to daemon'}
         try:
-            self.sock.sendall(json.dumps(message).encode())
-            data = self.sock.recv(4096)
-            if not data:
-                self.connected = False
-                return {'status': 'error', 'message': 'No response from daemon'}
+            payload = json.dumps(message).encode()
+            self.sock.sendall(struct.pack('>I', len(payload)) + payload)
+            raw_len = self._recv_all(4)
+            msg_len = struct.unpack('>I', raw_len)[0]
+            data = self._recv_all(msg_len)
             return json.loads(data.decode())
         except Exception as e:
             self.connected = False
@@ -53,7 +76,7 @@ class AbletonClient:
                 'address': address,
                 'args': args or []
             }
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             return await loop.run_in_executor(None, self._send_recv, message)
 
     def close(self):
@@ -163,6 +186,44 @@ async def find_track_by_name(name: str) -> str:
         return f"Error getting tracks: {response.get('message', 'Unknown error')}"
 
 
+async def _fetch_all_scenes() -> list:
+    """
+    Internal helper: fetch all scenes as a list of (index, name) tuples.
+    Stops at the first failure since scenes are contiguous in Ableton.
+    """
+    count_response = await ableton_client.send_command('/live/song/get/num_scenes', [])
+    if count_response.get('status') == 'success':
+        count_data = count_response.get('data', ())
+        num_scenes = int(count_data[0]) if count_data else 16
+    else:
+        num_scenes = 16  # fallback if endpoint not supported
+
+    scenes = []
+    for i in range(num_scenes):
+        r = await ableton_client.send_command('/live/scene/get/name', [i])
+        if r.get('status') == 'success':
+            data = strip_osc_prefix(list(r.get('data', ())), i)
+            scene_name = str(data[0]) if data else ''
+            scenes.append((i, scene_name))
+        else:
+            break
+    return scenes
+
+
+@mcp.tool()
+async def get_scene_names() -> str:
+    """
+    Get the names of all scenes in Ableton Live's session view.
+
+    Returns:
+        A formatted string listing every scene index and name
+    """
+    scenes = await _fetch_all_scenes()
+    if not scenes:
+        return "Could not retrieve scene names"
+    return "Scene Names:\n" + "\n".join(f"  {i}: '{name}'" for i, name in scenes)
+
+
 @mcp.tool()
 async def find_scene_by_name(name: str) -> str:
     """
@@ -175,26 +236,7 @@ async def find_scene_by_name(name: str) -> str:
     Returns:
         Matching scene indices and names
     """
-    # Get scene count first to know how many to iterate
-    count_response = await ableton_client.send_command('/live/song/get/num_scenes', [])
-    if count_response.get('status') == 'success':
-        count_data = count_response.get('data', ())
-        num_scenes = int(count_data[0]) if count_data else 16
-    else:
-        num_scenes = 16  # fallback if endpoint not supported
-
-    # Fetch each scene name individually via /live/scene/get/name
-    scenes = []
-    for i in range(num_scenes):
-        r = await ableton_client.send_command('/live/scene/get/name', [i])
-        if r.get('status') == 'success':
-            data = strip_osc_prefix(list(r.get('data', ())), i)
-            scene_name = str(data[0]) if data else ''
-            scenes.append((i, scene_name))
-        else:
-            # Stop on first failure — scenes are contiguous in Ableton
-            break
-
+    scenes = await _fetch_all_scenes()
     if not scenes:
         return "Could not retrieve scene names"
 
@@ -548,6 +590,77 @@ async def stop_all_clips() -> str:
         return "Stopped all clips"
     else:
         return f"Error stopping clips: {response.get('message', 'Unknown error')}"
+
+
+@mcp.tool()
+async def start_playback() -> str:
+    """
+    Start playback of the Ableton Live session (press Play).
+
+    Returns:
+        Status message
+    """
+    response = await ableton_client.send_command('/live/song/start_playing', [])
+    if response.get('status') in ('success', 'sent'):
+        return "Playback started"
+    else:
+        return f"Error starting playback: {response.get('message', 'Unknown error')}"
+
+
+@mcp.tool()
+async def stop_playback() -> str:
+    """
+    Stop playback of the Ableton Live session (press Stop).
+
+    Returns:
+        Status message
+    """
+    response = await ableton_client.send_command('/live/song/stop_playing', [])
+    if response.get('status') in ('success', 'sent'):
+        return "Playback stopped"
+    else:
+        return f"Error stopping playback: {response.get('message', 'Unknown error')}"
+
+
+@mcp.tool()
+async def fire_clip(track_index: int, clip_index: int) -> str:
+    """
+    Fire (launch) a specific clip slot in Ableton Live's session view.
+    This is more granular than play_scene — it launches a single clip.
+    IMPORTANT: Track indices shift often. Call find_track_by_name() first to get the current index.
+
+    Args:
+        track_index: Zero-based index of the track
+        clip_index: Zero-based index of the clip slot (scene row)
+
+    Returns:
+        Status message
+    """
+    response = await ableton_client.send_command('/live/clip/fire', [track_index, clip_index])
+    if response.get('status') in ('success', 'sent'):
+        return f"Fired clip at track {track_index}, slot {clip_index}"
+    else:
+        return f"Error firing clip: {response.get('message', 'Unknown error')}"
+
+
+@mcp.tool()
+async def stop_clip(track_index: int, clip_index: int) -> str:
+    """
+    Stop a specific clip playing in Ableton Live's session view.
+    IMPORTANT: Track indices shift often. Call find_track_by_name() first to get the current index.
+
+    Args:
+        track_index: Zero-based index of the track
+        clip_index: Zero-based index of the clip slot (scene row)
+
+    Returns:
+        Status message
+    """
+    response = await ableton_client.send_command('/live/clip/stop', [track_index, clip_index])
+    if response.get('status') in ('success', 'sent'):
+        return f"Stopped clip at track {track_index}, slot {clip_index}"
+    else:
+        return f"Error stopping clip: {response.get('message', 'Unknown error')}"
 
 
 if __name__ == "__main__":
